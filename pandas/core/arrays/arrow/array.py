@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
     TypeVar,
     cast,
 )
@@ -116,6 +117,11 @@ if not pa_version_under6p0:
     }
 
 if TYPE_CHECKING:
+    from pandas._typing import (
+        NumpySorter,
+        NumpyValueArrayLike,
+    )
+
     from pandas import Series
 
 ArrowExtensionArrayT = TypeVar("ArrowExtensionArrayT", bound="ArrowExtensionArray")
@@ -206,17 +212,17 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
         Construct a new ExtensionArray from a sequence of scalars.
         """
         pa_dtype = to_pyarrow_type(dtype)
-        is_cls = isinstance(scalars, cls)
-        if is_cls or isinstance(scalars, (pa.Array, pa.ChunkedArray)):
-            if is_cls:
-                scalars = scalars._data
-            if pa_dtype:
-                scalars = scalars.cast(pa_dtype)
-            return cls(scalars)
-        else:
-            return cls(
-                pa.chunked_array(pa.array(scalars, type=pa_dtype, from_pandas=True))
-            )
+        if isinstance(scalars, cls):
+            scalars = scalars._data
+        elif not isinstance(scalars, (pa.Array, pa.ChunkedArray)):
+            try:
+                scalars = pa.array(scalars, type=pa_dtype, from_pandas=True)
+            except pa.ArrowInvalid:
+                # GH50430: let pyarrow infer type, then cast
+                scalars = pa.array(scalars, from_pandas=True)
+        if pa_dtype:
+            scalars = scalars.cast(pa_dtype)
+        return cls(scalars)
 
     @classmethod
     def _from_sequence_of_strings(
@@ -406,8 +412,14 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
                 f"{op.__name__} not implemented for {type(other)}"
             )
 
-        result = result.to_numpy()
-        return BooleanArray._from_sequence(result)
+        if result.null_count > 0:
+            # GH50524: avoid conversion to object for better perf
+            values = pc.fill_null(result, False).to_numpy()
+            mask = result.is_null().to_numpy()
+        else:
+            values = result.to_numpy()
+            mask = np.zeros(len(values), dtype=np.bool_)
+        return BooleanArray(values, mask)
 
     def _evaluate_op_method(self, other, op, arrow_funcs):
         pc_func = arrow_funcs[op.__name__]
@@ -641,6 +653,15 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
         use_na_sentinel: bool = True,
     ) -> tuple[np.ndarray, ExtensionArray]:
         null_encoding = "mask" if use_na_sentinel else "encode"
+
+        pa_type = self._data.type
+        if pa.types.is_duration(pa_type):
+            # https://github.com/apache/arrow/issues/15226#issuecomment-1376578323
+            arr = cast(ArrowExtensionArray, self.astype("int64[pyarrow]"))
+            indices, uniques = arr.factorize(use_na_sentinel=use_na_sentinel)
+            uniques = uniques.astype(self.dtype)
+            return indices, uniques
+
         encoded = self._data.dictionary_encode(null_encoding=null_encoding)
         if encoded.length() == 0:
             indices = np.array([], dtype=np.intp)
@@ -660,6 +681,49 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
             f"{type(self)} does not support reshape "
             f"as backed by a 1D pyarrow.ChunkedArray."
         )
+
+    def round(
+        self: ArrowExtensionArrayT, decimals: int = 0, *args, **kwargs
+    ) -> ArrowExtensionArrayT:
+        """
+        Round each value in the array a to the given number of decimals.
+
+        Parameters
+        ----------
+        decimals : int, default 0
+            Number of decimal places to round to. If decimals is negative,
+            it specifies the number of positions to the left of the decimal point.
+        *args, **kwargs
+            Additional arguments and keywords have no effect.
+
+        Returns
+        -------
+        ArrowExtensionArray
+            Rounded values of the ArrowExtensionArray.
+
+        See Also
+        --------
+        DataFrame.round : Round values of a DataFrame.
+        Series.round : Round values of a Series.
+        """
+        return type(self)(pc.round(self._data, ndigits=decimals))
+
+    @doc(ExtensionArray.searchsorted)
+    def searchsorted(
+        self,
+        value: NumpyValueArrayLike | ExtensionArray,
+        side: Literal["left", "right"] = "left",
+        sorter: NumpySorter = None,
+    ) -> npt.NDArray[np.intp] | np.intp:
+        if self._hasna:
+            raise ValueError(
+                "searchsorted requires array to be sorted, which is impossible "
+                "with NAs present."
+            )
+        if isinstance(value, ExtensionArray):
+            value = value.astype(object)
+        # Base class searchsorted would cast to object, which is *much* slower.
+        return self.to_numpy().searchsorted(value, side=side, sorter=sorter)
 
     def take(
         self,
@@ -794,6 +858,12 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
         -------
         ArrowExtensionArray
         """
+        if pa.types.is_duration(self._data.type):
+            # https://github.com/apache/arrow/issues/15226#issuecomment-1376578323
+            arr = cast(ArrowExtensionArrayT, self.astype("int64[pyarrow]"))
+            result = arr.unique()
+            return cast(ArrowExtensionArrayT, result.astype(self.dtype))
+
         return type(self)(pc.unique(self._data))
 
     def value_counts(self, dropna: bool = True) -> Series:
@@ -813,6 +883,13 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
         --------
         Series.value_counts
         """
+        if pa.types.is_duration(self._data.type):
+            # https://github.com/apache/arrow/issues/15226#issuecomment-1376578323
+            arr = cast(ArrowExtensionArray, self.astype("int64[pyarrow]"))
+            result = arr.value_counts()
+            result.index = result.index.astype(self.dtype)
+            return result
+
         from pandas import (
             Index,
             Series,
@@ -852,6 +929,45 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
         chunks = [array for ea in to_concat for array in ea._data.iterchunks()]
         arr = pa.chunked_array(chunks)
         return cls(arr)
+
+    def _accumulate(
+        self, name: str, *, skipna: bool = True, **kwargs
+    ) -> ArrowExtensionArray | ExtensionArray:
+        """
+        Return an ExtensionArray performing an accumulation operation.
+
+        The underlying data type might change.
+
+        Parameters
+        ----------
+        name : str
+            Name of the function, supported values are:
+            - cummin
+            - cummax
+            - cumsum
+            - cumprod
+        skipna : bool, default True
+            If True, skip NA values.
+        **kwargs
+            Additional keyword arguments passed to the accumulation function.
+            Currently, there is no supported kwarg.
+
+        Returns
+        -------
+        array
+
+        Raises
+        ------
+        NotImplementedError : subclass does not define accumulations
+        """
+        pyarrow_name = {
+            "cumsum": "cumulative_sum_checked",
+        }.get(name, name)
+        pyarrow_meth = getattr(pc, pyarrow_name, None)
+        if pyarrow_meth is None:
+            return super()._accumulate(name, skipna=skipna, **kwargs)
+        result = pyarrow_meth(self._data, skip_nulls=skipna, **kwargs)
+        return type(self)(result)
 
     def _reduce(self, name: str, *, skipna: bool = True, **kwargs):
         """
@@ -912,7 +1028,7 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
             return self.dtype.na_value
         return result.as_py()
 
-    def __setitem__(self, key: int | slice | np.ndarray, value: Any) -> None:
+    def __setitem__(self, key, value) -> None:
         """Set one or more values inplace.
 
         Parameters
@@ -933,6 +1049,10 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
         -------
         None
         """
+        # GH50085: unwrap 1D indexers
+        if isinstance(key, tuple) and len(key) == 1:
+            key = key[0]
+
         key = check_array_indexer(self, key)
         value = self._maybe_convert_setitem_value(value)
 
@@ -958,7 +1078,6 @@ class ArrowExtensionArray(OpsMixin, ExtensionArray):
                 return
 
         indices = self._indexing_key_to_indices(key)
-
         argsort = np.argsort(indices)
         indices = indices[argsort]
 

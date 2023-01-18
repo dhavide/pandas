@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable  # noqa: PDF001
 import re
-from typing import Union
+from typing import (
+    Callable,
+    Union,
+)
 
 import numpy as np
 
@@ -84,7 +86,7 @@ class ArrowStringArray(ArrowExtensionArray, BaseStringArray, ObjectStringArrayMi
 
     See Also
     --------
-    array
+    :func:`pandas.array`
         The recommended function for creating a ArrowStringArray.
     Series.str
         The string methods are available on Series backed by
