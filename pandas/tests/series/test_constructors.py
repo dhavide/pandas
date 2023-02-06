@@ -43,8 +43,8 @@ from pandas import (
     timedelta_range,
 )
 import pandas._testing as tm
-from pandas.core.api import Int64Index
 from pandas.core.arrays import (
+    IntegerArray,
     IntervalArray,
     period_array,
 )
@@ -52,6 +52,16 @@ from pandas.core.internals.blocks import NumericBlock
 
 
 class TestSeriesConstructors:
+    def test_from_ints_with_non_nano_dt64_dtype(self, index_or_series):
+        values = np.arange(10)
+
+        res = index_or_series(values, dtype="M8[s]")
+        expected = index_or_series(values.astype("M8[s]"))
+        tm.assert_equal(res, expected)
+
+        res = index_or_series(list(values), dtype="M8[s]")
+        tm.assert_equal(res, expected)
+
     def test_from_na_value_and_interval_of_datetime_dtype(self):
         # GH#41805
         ser = Series([None], dtype="interval[datetime64[ns]]")
@@ -75,7 +85,7 @@ class TestSeriesConstructors:
     def test_unparseable_strings_with_dt64_dtype(self):
         # pre-2.0 these would be silently ignored and come back with object dtype
         vals = ["aa"]
-        msg = "^Unknown string format: aa, at position 0$"
+        msg = "^Unknown datetime string format, unable to parse: aa, at position 0$"
         with pytest.raises(ValueError, match=msg):
             Series(vals, dtype="datetime64[ns]")
 
@@ -134,10 +144,6 @@ class TestSeriesConstructors:
         # Pass in scalar is disabled
         scalar = Series(0.5)
         assert not isinstance(scalar, float)
-
-        # Coercion
-        assert float(Series([1.0])) == 1.0
-        assert int(Series([1.0])) == 1
 
     def test_scalar_extension_dtype(self, ea_scalar_and_dtype):
         # GH 28401
@@ -708,7 +714,7 @@ class TestSeriesConstructors:
             timedelta_range("1 day", periods=3),
             period_range("2012Q1", periods=3, freq="Q"),
             Index(list("abc")),
-            Int64Index([1, 2, 3]),
+            Index([1, 2, 3]),
             RangeIndex(0, 3),
         ],
         ids=lambda x: type(x).__name__,
@@ -1999,6 +2005,50 @@ class TestSeriesConstructors:
         # GH#42137
         with pytest.raises(ValueError, match="invalid literal"):
             Series(["True", "False", "True", pd.NA], dtype="Int64")
+
+    @pytest.mark.parametrize("val", [1, 1.0])
+    def test_series_constructor_overflow_uint_ea(self, val):
+        # GH#38798
+        max_val = np.iinfo(np.uint64).max - 1
+        result = Series([max_val, val], dtype="UInt64")
+        expected = Series(np.array([max_val, 1], dtype="uint64"), dtype="UInt64")
+        tm.assert_series_equal(result, expected)
+
+    @pytest.mark.parametrize("val", [1, 1.0])
+    def test_series_constructor_overflow_uint_ea_with_na(self, val):
+        # GH#38798
+        max_val = np.iinfo(np.uint64).max - 1
+        result = Series([max_val, val, pd.NA], dtype="UInt64")
+        expected = Series(
+            IntegerArray(
+                np.array([max_val, 1, 0], dtype="uint64"),
+                np.array([0, 0, 1], dtype=np.bool_),
+            )
+        )
+        tm.assert_series_equal(result, expected)
+
+    def test_series_constructor_overflow_uint_with_nan(self):
+        # GH#38798
+        max_val = np.iinfo(np.uint64).max - 1
+        result = Series([max_val, np.nan], dtype="UInt64")
+        expected = Series(
+            IntegerArray(
+                np.array([max_val, 1], dtype="uint64"),
+                np.array([0, 1], dtype=np.bool_),
+            )
+        )
+        tm.assert_series_equal(result, expected)
+
+    def test_series_constructor_ea_all_na(self):
+        # GH#38798
+        result = Series([np.nan, np.nan], dtype="UInt64")
+        expected = Series(
+            IntegerArray(
+                np.array([1, 1], dtype="uint64"),
+                np.array([1, 1], dtype=np.bool_),
+            )
+        )
+        tm.assert_series_equal(result, expected)
 
 
 class TestSeriesConstructorIndexCoercion:

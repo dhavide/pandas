@@ -41,7 +41,6 @@ from pandas import (
     date_range,
 )
 import pandas._testing as tm
-from pandas.core.api import NumericIndex
 
 fix_now = pd.Timestamp("2021-01-01")
 fix_utcnow = pd.Timestamp("2021-01-01", tz="UTC")
@@ -406,10 +405,10 @@ def test_array_equivalent(dtype_equal):
         np.array(["a", "b", "c", "d"]), np.array(["e", "e"]), dtype_equal=dtype_equal
     )
     assert array_equivalent(
-        NumericIndex([0, np.nan]), NumericIndex([0, np.nan]), dtype_equal=dtype_equal
+        Index([0, np.nan]), Index([0, np.nan]), dtype_equal=dtype_equal
     )
     assert not array_equivalent(
-        NumericIndex([0, np.nan]), NumericIndex([1, np.nan]), dtype_equal=dtype_equal
+        Index([0, np.nan]), Index([1, np.nan]), dtype_equal=dtype_equal
     )
     assert array_equivalent(
         DatetimeIndex([0, np.nan]), DatetimeIndex([0, np.nan]), dtype_equal=dtype_equal
@@ -726,9 +725,16 @@ class TestNAObj:
         arr = np.atleast_2d(arr)
         expected = np.atleast_2d(expected)
 
-        result = libmissing.isnaobj2d(arr)
+        result = libmissing.isnaobj(arr)
         tm.assert_numpy_array_equal(result, expected)
-        result = libmissing.isnaobj2d(arr, inf_as_na=True)
+        result = libmissing.isnaobj(arr, inf_as_na=True)
+        tm.assert_numpy_array_equal(result, expected)
+
+        # Test fortran order
+        arr = arr.copy(order="F")
+        result = libmissing.isnaobj(arr)
+        tm.assert_numpy_array_equal(result, expected)
+        result = libmissing.isnaobj(arr, inf_as_na=True)
         tm.assert_numpy_array_equal(result, expected)
 
     def test_basic(self):
